@@ -1,0 +1,16 @@
+services:
+  furnace-planner:
+    build: .
+    image: gonglu-baowen-planner:latest
+    container_name: gonglu-baowen-planner
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件位置（挂在下方的 Compose 命名卷上，重启可读）
+      PLANNER_DB: /data/planner.db
+    volumes:
+      - planner-data:/data
+    restart: unless-stopped
+
+volumes:
+  planner-data:

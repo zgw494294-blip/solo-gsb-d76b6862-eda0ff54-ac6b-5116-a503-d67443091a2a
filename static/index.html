@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>共炉保温编排台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <h1>共炉保温编排台</h1>
+    <p class="subtitle">
+      炉温初态 20°C，每档 5 分钟；在 20 档以内编排最短升温曲线，
+      让 2～3 种材料分别在各自保温区间内连续达标，末档回到 20°C。
+    </p>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="schedule">编排求解 / 续炉</button>
+      <button class="tab" data-tab="recipes">材料配方</button>
+      <button class="tab" data-tab="drafts">炉次草稿</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ========== 标签页 1：即时编排（保留原页面） ========== -->
+    <section class="tabpanel active" id="panel-schedule">
+      <section class="card" id="input-card">
+        <div class="card-head">
+          <h2>材料参数</h2>
+          <label class="count-select">
+            材料种类
+            <select id="material-count">
+              <option value="2">2 种</option>
+              <option value="3">3 种</option>
+            </select>
+          </label>
+        </div>
+
+        <form id="schedule-form" novalidate>
+          <div id="materials"></div>
+
+          <div class="executed-box">
+            <h3>已执行档位（可选，用于续炉判定 / 一键启动）</h3>
+            <p class="executed-hint">
+              输入 1～20 个已经执行的 5 分钟炉温档位（20～200°C 的整十数），
+              用逗号或空格分隔，例如 <code>40, 60, 80</code>。
+              系统会从初态 20°C 起逐档核验范围、整十度、相邻 ≤20°C 温差及所有材料
+              耐受上限；首个违规档即不予续排。留空则从零编排。
+            </p>
+            <input type="text" id="executed-input" autocomplete="off"
+                   placeholder="留空 = 无执行记录；示例：40, 60, 80, 80, 100" />
+          </div>
+
+          <div class="rules">
+            <h3>约束规则</h3>
+            <ul>
+              <li>保温上/下限：40～180°C 的整十数，下限不高于上限。</li>
+              <li>连续保温时长：5、10 或 15 分钟（即 1～3 个连续档位）。</li>
+              <li>耐受上限：不低于保温上限、至多 200°C 的整十数；所有档位都不得超过任何材料的耐受上限。</li>
+              <li>设定温度为 20～200°C 的整十数；首档与初态 20°C、相邻档位温差均不超过 20°C。</li>
+              <li>不同材料可以共用档位；材料达标后无需继续保温；离开保温区间时未达标进度归零。</li>
+              <li>目标：20 档以内的最短完整曲线；等长时取后续温度序列字典序最小。</li>
+              <li>提供「已执行档位」时：逐档核验通过后从末档温度接续，已用档位计入 20 档上限；首个违规档即不予续排。</li>
+            </ul>
+          </div>
+
+          <p class="form-error" id="form-error" hidden></p>
+          <div class="actions">
+            <button type="submit" id="submit-btn">一键启动编排</button>
+            <span class="hint">修改任一参数后，旧结果会自动清除。</span>
+          </div>
+        </form>
+      </section>
+
+      <div id="schedule-result-slot"></div>
+    </section>
+
+    <!-- ========== 标签页 2：材料配方 ========== -->
+    <section class="tabpanel" id="panel-recipes" hidden>
+      <section class="card">
+        <h2 id="recipe-form-title">新建材料配方</h2>
+        <p class="executed-hint">
+          配方沿用与「编排求解」完全相同的材料字段与校验：保温下限 / 上限
+          （40～180°C 整十数，下限不高于上限）、连续保温时长（5/10/15 分钟）、
+          耐受上限（不低于保温上限、至多 200°C 的整十数）。
+        </p>
+        <form id="recipe-form" novalidate>
+          <input type="hidden" id="recipe-edit-id" value="" />
+          <div id="recipe-fields" class="fields"></div>
+          <p class="form-error" id="recipe-error" hidden></p>
+          <div class="actions">
+            <button type="submit" id="recipe-save-btn">创建配方</button>
+            <button type="button" class="btn-secondary" id="recipe-cancel-btn" hidden>取消修改</button>
+            <span class="hint">配方可被多个炉次草稿共用；保存修改会重算所有引用它的草稿。</span>
+          </div>
+        </form>
+        <p class="form-ok" id="recipe-message" hidden></p>
+      </section>
+
+      <section class="card">
+        <h2>已有配方 <span class="hint" id="recipe-count"></span></h2>
+        <p class="executed-hint">
+          「停用」后配方不再可被新炉次引用（不改变参数与版本，已有引用草稿照常重算、归档，
+          已归档方案不受影响）；「恢复」后可再次被新炉次引用。停用的配方仍可整份修改并保持停用。
+        </p>
+        <div class="table-wrap">
+          <table id="recipes-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>名称</th><th>保温下限 °C</th><th>保温上限 °C</th>
+                <th>时长 (分钟)</th><th>耐受上限 °C</th><th>版本</th><th>状态</th><th>更新时间</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="empty-hint" id="recipe-empty" hidden>还没有配方，先在上方创建。</p>
+      </section>
+    </section>
+
+    <!-- ========== 标签页 3：炉次草稿 ========== -->
+    <section class="tabpanel" id="panel-drafts" hidden>
+      <section class="card">
+        <h2>新建炉次草稿</h2>
+        <p class="executed-hint">
+          按顺序引用 <b>2～3 个不同的现有配方</b>（引用创建后不可改；
+          仅「可用」状态的配方可被新炉次引用，已停用配方不出现在下拉中）。
+          草稿从 20°C 空记录自动求解，版本从 1 开始。
+        </p>
+        <form id="draft-form" novalidate>
+          <label class="field">
+            <span class="field-label">炉次名称（可留空）</span>
+            <input type="text" id="draft-name" maxlength="20" placeholder="例如：10 月 1 号炉" />
+          </label>
+          <div class="card-head">
+            <label class="count-select">
+              引用配方数
+              <select id="draft-count">
+                <option value="2">2 个</option>
+                <option value="3">3 个</option>
+              </select>
+            </label>
+          </div>
+          <div id="draft-refs"></div>
+          <p class="form-error" id="draft-error" hidden></p>
+          <div class="actions">
+            <button type="submit" id="draft-create-btn">创建并求解</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>炉次草稿列表</h2>
+        <div class="table-wrap">
+          <table id="drafts-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>名称</th><th>引用配方</th><th>版本</th>
+                <th>状态</th><th>求解</th><th>更新时间</th><th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="empty-hint" id="draft-empty" hidden>还没有炉次草稿。</p>
+      </section>
+
+      <section class="card" id="draft-detail-card" hidden>
+        <div class="card-head">
+          <h2 id="draft-detail-title">炉次详情</h2>
+          <div>
+            <button class="btn-secondary" id="draft-refresh-btn" type="button">刷新</button>
+            <button class="btn-secondary" id="draft-sheet-btn" type="button" hidden>下载 HTML 工艺单</button>
+            <button id="draft-archive-btn" type="button">核准归档</button>
+          </div>
+        </div>
+        <p class="form-error" id="draft-detail-error" hidden></p>
+        <p class="form-ok" id="draft-detail-ok" hidden></p>
+        <p class="form-ok" id="draft-sheet-ok" hidden></p>
+        <p class="form-error" id="draft-sheet-error" hidden></p>
+        <div id="draft-meta" class="summary"></div>
+        <div id="draft-result-slot"></div>
+      </section>
+
+      <!-- 原曲线复用检查：仅已归档炉次显示；只读当前配方，不重新求解 -->
+      <section class="card" id="draft-reuse-card" hidden>
+        <h2>原曲线复用检查 <span class="badge status-archived">只读 · 不求解</span></h2>
+        <p class="executed-hint">
+          按原配方引用顺序读取各配方<b>当前</b>参数与状态，核验本炉次<b>归档冻结</b>的
+          温度曲线是否仍然成立：连续保温沿用原规则（每档 5 分钟，落在保温区间内累计，
+          离开区间未达标进度归零），达标后仍逐档检查全曲线耐受；停用配方同样完成温度
+          检查。全部材料保温达标、无任何超限且配方均可用时才标为可复用。
+          检查不重新求解，也不改动配方、草稿或归档。
+        </p>
+        <p class="form-error" id="reuse-error" hidden></p>
+        <div class="actions">
+          <button type="button" id="reuse-submit-btn">检查原曲线能否复用</button>
+          <span class="hint">结论不保存；切换或刷新详情会立即清除。</span>
+        </div>
+        <div id="reuse-result"></div>
+      </section>
+
+      <!-- 电费试算：仅已归档炉次显示；只读冻结曲线，不保存试算、不改动方案 -->
+      <section class="card" id="draft-electricity-card" hidden>
+        <h2>归档炉次电费试算 <span class="badge status-archived">只读 · 不保存</span></h2>
+        <p class="executed-hint">
+          基于本炉次<b>归档冻结</b>的温度曲线逐档试算：每档 5 分钟内功率恒定；
+          电价按 00～23 时给出、每天重复；档位跨小时（含跨午夜）时按落入各小时的
+          分钟数分摊。逐档费用各自四舍五入到分，总费用按<b>未舍入</b>逐档金额
+          汇总后再四舍五入。配方后续修改或停用均不影响本试算。
+        </p>
+        <form id="electricity-form" novalidate>
+          <div class="elec-top">
+            <label class="field elec-start">
+              <span class="field-label">开炉分钟（距当天 00:00，0～1439 整数）</span>
+              <input type="number" id="elec-start" min="0" max="1439" step="1" value="0" />
+            </label>
+          </div>
+          <h3>分时电价（元 / kWh，按 00～23 时，每天重复）</h3>
+          <div id="elec-prices" class="elec-price-grid"></div>
+          <h3>逐档功率（kW，与冻结曲线等长）</h3>
+          <div id="elec-powers" class="elec-power-grid"></div>
+          <p class="form-error" id="elec-error" hidden></p>
+          <div class="actions">
+            <button type="submit" id="elec-submit-btn">试算电费</button>
+            <span class="hint">试算结果不保存，也不会改动归档方案。</span>
+          </div>
+        </form>
+        <div id="elec-result"></div>
+      </section>
+    </section>
+  </main>
+
+  <footer>
+    <span>共炉保温编排台 · FastAPI + SQLite + 原生 HTML/CSS/JS</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
