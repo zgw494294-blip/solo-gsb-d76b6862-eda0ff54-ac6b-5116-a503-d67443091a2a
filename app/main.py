@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.6.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.7.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -64,12 +64,16 @@ def _validation_handler(request: Request, exc: RequestValidationError):
 
 def _raise_store_error(exc: store.StoreError) -> None:
     text = getattr(exc, "detail", None) or str(exc)
-    # 409 版本过期时附当前版本，方便调用方刷新后重试
-    if isinstance(exc, store.Conflict) and exc.current_version is not None:
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail={"detail": text, "currentVersion": exc.current_version},
-        )
+    # 409 版本过期时附当前版本，方便调用方刷新后重试；质检阻断等冲突
+    # 还会携带结构化附加信息（如 blockedRecipes），一并合并进 detail 对象
+    if isinstance(exc, store.Conflict) and (
+        exc.current_version is not None or exc.extra
+    ):
+        payload: dict = {"detail": text}
+        if exc.current_version is not None:
+            payload["currentVersion"] = exc.current_version
+        payload.update(exc.extra)
+        raise HTTPException(status_code=exc.status_code, detail=payload)
     raise HTTPException(status_code=exc.status_code, detail=text)
 
 
@@ -631,8 +635,9 @@ def get_furnace_runs():
 def start_furnace_run(payload: FurnaceStartIn):
     # 开炉登记（不控制设备）：只能启动计划首项；每炉次仅执行一次，同时仅
     # 一项进行中。成功保存 running 记录（冻结计划起止）、计划 version +1。
-    # 旧版本 / 非首项 / 已有进行中 / 该炉次已执行过 => 409，未知炉次 =>
-    # 404，非法分钟（早于计划开始或上次实际结束等）=> 422；失败不改状态。
+    # 旧版本 / 非首项 / 已有进行中 / 该炉次已执行过 / 归档配方版本被实测
+    # 质检阻断 => 409（阻断附配方与来源炉次），未知炉次 => 404，非法分钟
+    # （早于计划开始或上次实际结束等）=> 422；失败不改状态。
     try:
         return store.start_furnace_run(
             payload.draft_id, payload.version, payload.actual_start_minute
@@ -653,6 +658,61 @@ def finish_furnace_run(payload: FurnaceFinishIn):
         )
     except store.StoreError as exc:
         _raise_store_error(exc)
+
+
+# ---------------- 炉次实测温度质检与同版工艺阻断 ----------------
+
+
+class InspectionIn(BaseModel):
+    # 1～20 个 0～200°C 有限数：依次代表实际开始后的每 5 分钟恒温实测值；
+    # 档数 ×5 须等于该炉次实际时长（语义校验在 store 内，非法返回 422）
+    temperatures: list[Any]
+
+    @field_validator("temperatures")
+    @classmethod
+    def _temperatures(cls, v):
+        if not isinstance(v, list):
+            raise ValueError("实测温度必须是以数组形式给出的档位列表。")
+        if not (1 <= len(v) <= 20):
+            raise ValueError("实测温度档位数量必须为 1～20 个。")
+        for i, raw in enumerate(v, start=1):
+            # 只接受有限数（整数或小数）；拒绝布尔、字符串与 NaN/Infinity
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise ValueError(
+                    f"第 {i} 档实测温度必须是 0～200°C 的有限数。"
+                )
+            if not math.isfinite(raw) or not (0 <= raw <= 200):
+                raise ValueError(
+                    f"第 {i} 档实测温度 {raw} 超出 0～200°C 的允许范围。"
+                )
+        return v
+
+
+@app.put("/api/furnace-runs/{draft_id}/inspection")
+def put_furnace_run_inspection(draft_id: int, payload: InspectionIn):
+    # 提交（整份保存或替换）已结束炉次的实测温度质检；按归档冻结配方核验
+    # 连续保温与全程耐受（不核验升降温与末温），不合格也保存；未达标或
+    # 超限的（配方 ID，冻结版本）被阻断。未知炉次 => 404，未开炉 / 未结束
+    # 或档数 ×5 不等于实际时长 => 422；失败不改数据。
+    try:
+        return store.put_run_inspection(draft_id, payload.temperatures)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.get("/api/furnace-runs/{draft_id}/inspection")
+def get_furnace_run_inspection(draft_id: int):
+    # 读取某炉次的实测质检（实测温度与逐项结论）；未知炉次或尚未提交 => 404
+    try:
+        return store.get_run_inspection(draft_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.get("/api/recipe-blocks")
+def get_recipe_blocks():
+    # 读取当前全部同版工艺阻断：配方 ID、冻结版本与来源炉次列表
+    return store.list_recipe_blocks()
 
 
 @app.get("/healthz")

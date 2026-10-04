@@ -149,6 +149,35 @@ CREATE TABLE IF NOT EXISTS furnace_runs (
     ended_at            TEXT,
     FOREIGN KEY (draft_id) REFERENCES drafts(id)
 );
+
+-- 炉次实测温度质检：每个已结束炉次至多一份（draft_id 唯一，整份保存或
+-- 替换，不合格也保存）。实测为实际开始后每 5 分钟一个的恒温值（1～20 个
+-- 0～200°C 有限数，档数 ×5 须等于实际时长）；结论按归档冻结配方核验
+-- （连续保温 + 全程耐受，不核验升降温与末温），items_json 按引用顺序保存
+-- 逐项结论（配方 ID、冻结版本、首次达标区间、首次超限档号）。配方之后的
+-- 修改 / 停用不改已保存的质检。随现有 SQLite 卷跨重启保留；旧库启动时由
+-- CREATE TABLE IF NOT EXISTS 自动初始化为空表。
+CREATE TABLE IF NOT EXISTS run_inspections (
+    draft_id        INTEGER PRIMARY KEY,
+    run_id          INTEGER NOT NULL,
+    temperatures    TEXT NOT NULL,   -- JSON 数组：逐档实测温度（原样保存）
+    items_json      TEXT NOT NULL,   -- JSON 数组：按引用顺序的逐项结论
+    qualified       INTEGER NOT NULL, -- 1 合格 / 0 不合格
+    created_at      TEXT NOT NULL,   -- 首次提交时间（替换不改变）
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY (draft_id) REFERENCES drafts(id)
+);
+
+-- 同版工艺阻断：质检未达标或超限的 (配方 ID, 冻结版本) 按来源炉次各记
+-- 一行；替换质检时在同一事务里按新结论增删本炉次的行，同版其他失败来源
+-- 仍在则阻断继续。开炉登记按炉次归档冻结的配方版本查本表，命中即 409。
+CREATE TABLE IF NOT EXISTS recipe_blocks (
+    recipe_id       INTEGER NOT NULL,
+    recipe_version  INTEGER NOT NULL,
+    source_draft_id INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (recipe_id, recipe_version, source_draft_id)
+);
 """
 
 

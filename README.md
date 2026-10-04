@@ -14,7 +14,9 @@
   `app/reuse.py`，归档快照离线 HTML 工艺单导出见 `app/exports.py`；
   单台炉已归档炉次开炉计划见 `GET/PUT /api/furnace-plan`，计划首项的
   开炉 / 结束登记（不控制设备）见
-  `GET /api/furnace-runs`、`POST /api/furnace-runs/start|finish`）
+  `GET /api/furnace-runs`、`POST /api/furnace-runs/start|finish`；
+  已结束炉次的实测温度质检与同版工艺阻断见
+  `PUT/GET /api/furnace-runs/{id}/inspection`、`GET /api/recipe-blocks`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
   页面分为「编排求解 / 材料配方 / 炉次草稿」三个标签页；已归档炉次详情中
   含原曲线复用检查、电费试算卡片与单份 HTML 工艺单下载）
@@ -337,8 +339,11 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | GET | `/api/furnace-plan` | 读取单台炉开炉计划（version + 排段，按开始分钟、ID 排序；空计划版本 1） |
 | PUT | `/api/furnace-plan` | 批量提交 1～20 项改动（非负整数 Unix 开始分钟，null 移除，未提及保留；同批可交换；版本过期/重叠/改时移除进行中项/重排已结束项 409、未知炉次 404、未归档/非法输入 422；成功整批写入、版本 +1） |
 | GET | `/api/furnace-runs` | 按开炉顺序读取执行记录与当前占炉（`current` 进行中记录或 null，`runs` 含炉次 ID、计划起止、实际起止、状态；未结束结束分钟为 null） |
-| POST | `/api/furnace-runs/start` | 开炉登记（不控制设备）：提交炉次 ID、所读计划 version 与实际开始分钟，只能启动计划首项；201；旧 version / 非首项 / 已有进行中 / 每炉次重复执行 409、未知炉次 404、非法分钟 422；成功冻结计划起止、计划 version +1 |
+| POST | `/api/furnace-runs/start` | 开炉登记（不控制设备）：提交炉次 ID、所读计划 version 与实际开始分钟，只能启动计划首项；201；旧 version / 非首项 / 已有进行中 / 每炉次重复执行 / 归档配方版本被实测质检阻断 409（阻断附配方与来源炉次）、未知炉次 404、非法分钟 422；成功冻结计划起止、计划 version +1 |
 | POST | `/api/furnace-runs/finish` | 结束登记：提交进行中炉次 ID 与结束分钟；保存记录、释放占炉、移除计划项与计划 version +1 同一事务生效，不挪动后续计划；状态冲突 409、未知炉次 404、结束早于开始 422 |
+| PUT | `/api/furnace-runs/{id}/inspection` | 提交（整份保存或替换）已结束炉次的实测温度质检：1～20 个 0～200°C 有限数，档数 ×5 须等于实际时长；按归档配方核验连续保温与全程耐受，不合格也保存；未知炉次 404、未结束或输入非法 422 |
+| GET | `/api/furnace-runs/{id}/inspection` | 读取该炉次的实测质检（实测温度与逐项结论）；未知炉次或尚未提交 404 |
+| GET | `/api/recipe-blocks` | 读取当前同版工艺阻断：配方 ID、冻结版本与来源炉次列表（无阻断时 `blocks` 为空） |
 
 ### 从零编排（可直接复制执行）
 
@@ -1307,19 +1312,174 @@ curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
 请求体非法（`version<1`、分钟为负数 / 小数 / 布尔 / 字符串等）按统一
 参数校验返回 **422**，中文说明首个非法字段。
 
+## 炉次实测温度质检与同版工艺阻断（仅 HTTP）
+
+已**结束**的炉次可提交**实测温度质检**：以实际开始后的逐 5 分钟恒温
+实测值，按**归档冻结配方**核验**连续保温**与**全程耐受**（**不核验升
+降温及末温**），结论整份保存；未达标或超限的 **（配方 ID，冻结版本）**
+被**阻断**，引用同版工艺的后续炉次开炉
+（`POST /api/furnace-runs/start`）返回 **409**。质检数据
+（`run_inspections` 表）与阻断（`recipe_blocks` 表）同在现有 SQLite 卷
+（`planner-data`）里，**跨重启保留**；旧库启动时自动初始化为空表。
+
+规则：
+
+- **提交**：`PUT /api/furnace-runs/{id}/inspection`，请求体
+  `{"temperatures": [...]}`——**1～20 个 0～200°C 有限数**（整数或
+  小数，拒绝布尔 / 字符串 / NaN / Infinity），依次代表**实际开始后**
+  的每 5 分钟恒温；**档数 ×5 须等于实际时长**（实际结束 − 实际开始）；
+- **每炉次一份**：重复提交**整份替换**实测与结论（**不合格也保存**；
+  首次提交时间保留，替换只刷新更新时间）；
+- **逐项结论按引用顺序**返回：配方 ID（`recipeId`）、冻结版本
+  （`recipeVersion`，即归档时的配方版本）、**首次达标区间** `window`
+  （`startStep` / `endStep`，档号从 1 起，未达标为 `null`）、**首次超限
+  档号** `toleranceBreachStep`（从 1 起，无超限为 `null`）；全部达标且
+  无任何超限时 `qualified` 为 `true`；
+- **阻断**：未达标（`holdOk:false`）或超限（`toleranceBreachStep` 非
+  null）的（配方 ID，冻结版本）各记一条，**来源炉次**可多个；替换质检
+  按新结论**增删本炉次**的阻断，**同版其他失败来源仍在则继续阻断**；
+- **开炉遇阻断**：`POST /api/furnace-runs/start` 按该炉次**归档冻结的
+  配方版本**核验，命中即 **409**，响应附 `blockedRecipes`（配方 ID、
+  冻结版本、来源炉次列表）；
+- **质检与开炉按先后生效**：阻断先提交则不能开炉；**先开炉者仍可结束**
+  （结束登记不查阻断）；
+- **未知炉次 404**（含未提交质检的读取），**未结束（未开炉 / 进行中）
+  或输入非法 422**；任何失败都**不改数据**；
+- **配方修改 / 停用不改质检与阻断**（结论按归档冻结版本保存与生效）；
+  开炉计划与归档方案不受质检影响。
+
+### 提交质检与阻断生效（可直接复制执行）
+
+全新实例上依次执行：建配方 → 建炉次 → 归档 → 计划 → 开炉 → 结束 →
+提交质检。
+
+```bash
+# 1) 两个配方 + 一个引用它们的炉次草稿（创建即求解，版本均为 1）
+curl -sS -X POST http://localhost:8000/api/recipes \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"钢甲","holdLow":60,"holdHigh":100,"duration":10,"tolerance":150}'
+curl -sS -X POST http://localhost:8000/api/recipes \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"铜乙","holdLow":80,"holdHigh":120,"duration":5,"tolerance":160}'
+curl -sS -X POST http://localhost:8000/api/drafts \
+  -H 'Content-Type: application/json' -d '{"name":"十月首炉","recipeIds":[1,2]}'
+
+# 2) 归档炉次 1（冻结曲线 6 档 = 30 分钟），排入计划并开炉、结束：
+#    实际 29851680～29851710，共 30 分钟 = 6 档
+curl -sS -X POST http://localhost:8000/api/drafts/1/archive \
+  -H 'Content-Type: application/json' -d '{"version":1}'
+curl -sS -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "changes": [{"draftId": 1, "startMinute": 29851680}]}'
+curl -sS -X POST http://localhost:8000/api/furnace-runs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 1, "version": 2, "actualStartMinute": 29851680}'
+curl -sS -X POST http://localhost:8000/api/furnace-runs/finish \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 1, "actualEndMinute": 29851710}'
+
+# 3) 提交合格质检：6 档 × 5 = 30 分钟 = 实际时长
+curl -sS -X PUT http://localhost:8000/api/furnace-runs/1/inspection \
+  -H 'Content-Type: application/json' \
+  -d '{"temperatures": [40, 60, 80, 80, 60, 40]}'
+```
+
+第 3 步返回（HTTP 200）：
+
+```json
+{
+  "draftId": 1,
+  "runId": 1,
+  "temperatures": [40, 60, 80, 80, 60, 40],
+  "stepCount": 6,
+  "actualStartMinute": 29851680,
+  "actualEndMinute": 29851710,
+  "items": [
+    {"recipeId": 1, "recipeVersion": 1, "holdOk": true,
+     "window": {"startStep": 2, "endStep": 3}, "toleranceBreachStep": null},
+    {"recipeId": 2, "recipeVersion": 1, "holdOk": true,
+     "window": {"startStep": 3, "endStep": 3}, "toleranceBreachStep": null}
+  ],
+  "qualified": true,
+  "createdAt": "2026-10-04T09:00:00Z",
+  "updatedAt": "2026-10-04T09:00:00Z"
+}
+```
+
+```bash
+# 4) 替换为不合格实测：第 4 档 155°C 超钢甲耐受 150°C（不合格也保存）
+curl -sS -X PUT http://localhost:8000/api/furnace-runs/1/inspection \
+  -H 'Content-Type: application/json' \
+  -d '{"temperatures": [40, 60, 80, 155, 60, 40]}'
+# items[0]：holdOk 仍 true（第 2～3 档已连续达标），toleranceBreachStep=4
+# → qualified=false，（配方 1，版本 1）被阻断，来源炉次 1
+
+# 5) 读取质检与阻断
+curl -sS http://localhost:8000/api/furnace-runs/1/inspection
+curl -sS http://localhost:8000/api/recipe-blocks
+# {"blocks":[{"recipeId":1,"recipeVersion":1,"sourceDraftIds":[1]}]}
+
+# 6) 同版工艺的新炉次（配方 1、2 仍是版本 1）归档并排入计划后，开炉被阻断
+curl -sS -X POST http://localhost:8000/api/drafts \
+  -H 'Content-Type: application/json' -d '{"name":"十月二炉","recipeIds":[1,2]}'
+curl -sS -X POST http://localhost:8000/api/drafts/2/archive \
+  -H 'Content-Type: application/json' -d '{"version":1}'
+curl -sS -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 4, "changes": [{"draftId": 2, "startMinute": 29851720}]}'
+curl -sS -i -X POST http://localhost:8000/api/furnace-runs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 2, "version": 5, "actualStartMinute": 29851720}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"detail":"炉次 2 的归档配方版本被实测质检阻断：配方 1（版本 1，来源炉次 1），不能开炉。",
+#            "currentVersion":5,
+#            "blockedRecipes":[{"recipeId":1,"recipeVersion":1,"sourceDraftIds":[1]}]}}
+
+# 7) 把炉次 1 的质检替换回合格 → 本炉次阻断行删除，同版无其他来源则阻断解除
+curl -sS -X PUT http://localhost:8000/api/furnace-runs/1/inspection \
+  -H 'Content-Type: application/json' \
+  -d '{"temperatures": [40, 60, 80, 80, 60, 40]}'
+curl -sS http://localhost:8000/api/recipe-blocks
+# {"blocks":[]}
+curl -sS -X POST http://localhost:8000/api/furnace-runs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 2, "version": 5, "actualStartMinute": 29851720}'
+# 201 Created（阻断解除后可正常开炉）
+```
+
+若同一（配方 ID，冻结版本）被**多个炉次**的质检判为不合格，阻断列表的
+`sourceDraftIds` 会列出全部来源；只有把它们的质检都替换为合格（或它们
+各自的结论不再覆盖该版本），阻断才解除。
+
+失败示例：
+
+```bash
+# 档数 ×5 ≠ 实际时长（炉次 1 实际 30 分钟，只给 5 档）→ 422，不改数据
+curl -sS -i -X PUT http://localhost:8000/api/furnace-runs/1/inspection \
+  -H 'Content-Type: application/json' \
+  -d '{"temperatures": [40, 60, 80, 80, 60]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"实测温度档数 5（×5 = 25 分钟）与该炉次实际时长 30 分钟不一致，档数 ×5 须等于实际时长。"}
+
+# 未开炉 / 未结束 → 422；未知炉次 → 404；未提交质检的读取 → 404
+curl -sS -i http://localhost:8000/api/furnace-runs/999/inspection
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 999 不存在。"}
+```
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / cancel / 复用检查 / 电费试算 / 工艺单下载 / 单台炉开炉计划 / 开炉结束登记）
+│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / cancel / 复用检查 / 电费试算 / 工艺单下载 / 单台炉开炉计划 / 开炉结束登记 / 实测质检与阻断）
 │   ├── solver.py      # 规则常量、校验与 BFS 求解（配方与草稿复用）
-│   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解）
+│   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解；实测质检的保温/耐受核验同用）
 │   ├── electricity.py # 已归档炉次电费试算（跨小时/午夜分摊、逐档与总费用舍入）
 │   ├── exports.py     # 已归档炉次单份离线 HTML 工艺单渲染（纯归档快照，样式内嵌）
-│   ├── db.py          # SQLite 连接、建表（含 furnace_runs 登记表）、全局读锁与写操作互斥锁
-│   └── store.py       # 配方 / 炉次草稿 / 归档 / 作废 / 归档曲线只读 / 复用检查 / 工艺单快照 / 开炉计划 / 开炉结束登记 的事务化读写
+│   ├── db.py          # SQLite 连接、建表（含 furnace_runs 登记、run_inspections 质检与 recipe_blocks 阻断表）、全局读锁与写操作互斥锁
+│   └── store.py       # 配方 / 炉次草稿 / 归档 / 作废 / 归档曲线只读 / 复用检查 / 工艺单快照 / 开炉计划 / 开炉结束登记 / 实测质检与同版阻断 的事务化读写
 ├── static/
 │   ├── index.html     # 页面（编排求解 / 材料配方 / 炉次草稿 三个标签页）
 │   ├── styles.css     # 样式
