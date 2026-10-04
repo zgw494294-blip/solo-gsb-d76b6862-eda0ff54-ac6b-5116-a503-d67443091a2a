@@ -149,6 +149,24 @@ CREATE TABLE IF NOT EXISTS furnace_runs (
     ended_at            TEXT,
     FOREIGN KEY (draft_id) REFERENCES drafts(id)
 );
+
+-- 已结束炉次的实测温度质检（每炉次一份，整份保存或替换，不合格也保存）：
+-- temperatures_json 为 1～20 个 0～200°C 有限数（依次代表实际开始后的
+-- 5 分钟恒温，档数 ×5 须等于实际时长）；items_json 为按引用顺序的逐项
+-- 结论（配方 ID、冻结版本、首次达标区间、首次超限档号）；passed 为整体
+-- 结论。阻断不另建表，由本表即时推导：任一未达标或超限项对应的
+-- （配方 ID, 冻结版本）被阻断，来源为对应炉次；替换实测即按新结论增减
+-- 本炉次的阻断贡献，同版其他失败来源仍在则继续阻断。随现有 SQLite 卷
+-- 跨重启保留；旧库启动时由 CREATE TABLE IF NOT EXISTS 自动初始化为空表。
+CREATE TABLE IF NOT EXISTS run_quality (
+    draft_id          INTEGER PRIMARY KEY,
+    temperatures_json TEXT NOT NULL,
+    items_json        TEXT NOT NULL,
+    passed            INTEGER NOT NULL,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    FOREIGN KEY (draft_id) REFERENCES drafts(id)
+);
 """
 
 

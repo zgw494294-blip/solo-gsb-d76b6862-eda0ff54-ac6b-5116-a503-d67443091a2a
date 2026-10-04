@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import electricity, exports, store
+from . import electricity, exports, quality, store
 from .db import init_db
 from .solver import Material, solve
 from .solver import validate_material as solver_validate_material
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.6.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.7.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -64,12 +64,16 @@ def _validation_handler(request: Request, exc: RequestValidationError):
 
 def _raise_store_error(exc: store.StoreError) -> None:
     text = getattr(exc, "detail", None) or str(exc)
-    # 409 版本过期时附当前版本，方便调用方刷新后重试
-    if isinstance(exc, store.Conflict) and exc.current_version is not None:
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail={"detail": text, "currentVersion": exc.current_version},
-        )
+    # 409 版本过期时附当前版本，方便调用方刷新后重试；质检阻断等冲突
+    # 可携带附加字段（如被阻断配方与来源炉次）
+    if isinstance(exc, store.Conflict) and (
+        exc.current_version is not None or exc.extra
+    ):
+        payload: dict = {"detail": text}
+        if exc.current_version is not None:
+            payload["currentVersion"] = exc.current_version
+        payload.update(exc.extra)
+        raise HTTPException(status_code=exc.status_code, detail=payload)
     raise HTTPException(status_code=exc.status_code, detail=text)
 
 
@@ -631,8 +635,10 @@ def get_furnace_runs():
 def start_furnace_run(payload: FurnaceStartIn):
     # 开炉登记（不控制设备）：只能启动计划首项；每炉次仅执行一次，同时仅
     # 一项进行中。成功保存 running 记录（冻结计划起止）、计划 version +1。
-    # 旧版本 / 非首项 / 已有进行中 / 该炉次已执行过 => 409，未知炉次 =>
-    # 404，非法分钟（早于计划开始或上次实际结束等）=> 422；失败不改状态。
+    # 旧版本 / 非首项 / 已有进行中 / 该炉次已执行过 / 归档版本被质检阻断
+    # => 409（阻断附配方与来源炉次），未知炉次 => 404，非法分钟（早于计划
+    # 开始或上次实际结束等）=> 422；失败不改状态。阻断与开炉按请求先后
+    # 串行生效：阻断先提交则不能开炉，先开炉者仍可结束。
     try:
         return store.start_furnace_run(
             payload.draft_id, payload.version, payload.actual_start_minute
@@ -653,6 +659,77 @@ def finish_furnace_run(payload: FurnaceFinishIn):
         )
     except store.StoreError as exc:
         _raise_store_error(exc)
+
+
+# ---------------- 已结束炉次实测温度质检与同版工艺阻断 ----------------
+
+
+_QUALITY_BODY_SCHEMA = {
+    "type": "object",
+    "required": ["temperatures"],
+    "properties": {
+        "temperatures": {
+            "title": "实测温度",
+            "description": (
+                "1～20 个 0～200°C 有限数，依次代表实际开始后的 5 分钟恒温；"
+                "档数 ×5 须等于实际时长（实际结束 − 实际开始分钟）"
+            ),
+            "type": "array",
+            "items": {"type": "number", "minimum": 0, "maximum": 200},
+            "minItems": 1,
+            "maxItems": 20,
+        },
+    },
+}
+
+
+@app.put(
+    "/api/furnace-runs/{draft_id}/quality",
+    response_model=None,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _QUALITY_BODY_SCHEMA}},
+        }
+    },
+)
+async def put_run_quality(draft_id: int, request: Request):
+    # 提交或整份替换一个已结束炉次的实测温度与质检结论（不合格也保存）。
+    # 未知炉次 => 404；未结束（未开炉 / 进行中）或输入非法（非 1～20 个
+    # 0～200°C 有限数、档数 ×5 不等于实际时长）=> 422；失败不改数据。
+    # 按归档冻结配方核验连续保温与全程耐受，不核验升降温及末温。
+    try:
+        raw = await request.body()
+        body = json.loads(raw.decode("utf-8") or "null")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="请求体不是合法的 JSON。") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="请求体必须是 JSON 对象。")
+    if "temperatures" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="缺少必填字段 temperatures（1～20 个实测温度）。",
+        )
+    try:
+        return store.submit_run_quality(draft_id, body["temperatures"])
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.get("/api/furnace-runs/{draft_id}/quality")
+def get_run_quality(draft_id: int):
+    # 读取一个炉次的质检记录：未知炉次 404；尚无质检记录 404
+    try:
+        return store.get_run_quality(draft_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.get("/api/recipe-blocks")
+def get_recipe_blocks():
+    # 读取当前全部同版工艺阻断：配方 ID、冻结版本与来源炉次（由质检记录
+    # 即时推导；替换实测后按新结论增减，同版其他失败来源仍在则继续阻断）
+    return store.list_recipe_blocks()
 
 
 @app.get("/healthz")

@@ -39,6 +39,20 @@
 - 计划修改（submit_furnace_plan）若改时或移除进行中项则整批拒绝；已结束
   炉次不得重新排入（任何对其计划项的设置都 409；移除早已被结束删去的
   计划项为空操作）。
+
+已结束炉次的实测温度质检（run_quality 表，每炉次一份，整份保存或替换，
+不合格也保存）与开炉登记共用同一把写互斥锁，按请求先后串行生效：
+
+- 提交质检（submit_run_quality）要求炉次已结束（未知炉次 404，未开炉 /
+  进行中 422），实测为 1～20 个 0～200°C 有限数且档数 ×5 等于实际时长；
+  按归档冻结配方核验连续保温与全程耐受（不核验升降温及末温），逐项结论
+  与实测整份落库；
+- 阻断由质检表即时推导：任一未达标或超限项对应的（配方 ID, 冻结版本）
+  被阻断，来源为对应炉次；替换实测按新结论增减本炉次阻断，同版其他
+  失败来源仍在则继续阻断；
+- 开炉（start_furnace_run）按归档冻结的配方版本核对当前阻断，命中即
+  409 并附配方与来源炉次；先开炉者不受此后提交的阻断影响，仍可结束。
+  配方修改 / 停用不改质检记录与阻断，计划与归档也不受质检读写影响。
 """
 
 from __future__ import annotations
@@ -48,7 +62,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from . import reuse
+from . import quality, reuse
 from .db import connect, lock, write_lock
 from .solver import Material, solve
 
@@ -69,10 +83,17 @@ class Conflict(StoreError):
 
     status_code = 409
 
-    def __init__(self, detail: str, current_version: int | None = None):
+    def __init__(
+        self,
+        detail: str,
+        current_version: int | None = None,
+        extra: dict | None = None,
+    ):
         super().__init__(detail)
         self.detail = detail
         self.current_version = current_version
+        # 随 409 一起返回的附加字段（如质检阻断的配方与来源炉次）
+        self.extra = extra or {}
 
 
 class Unprocessable(StoreError):
@@ -1346,7 +1367,9 @@ def start_furnace_run(
     4. 已有另一炉次进行中（占炉未释放）=> 409（同时仅一项进行中）；
     5. 该炉次不在计划中，或不是当前计划首项（按开始分钟、炉次 ID 排序）
        => 409（只能启动计划首项）；
-    6. 实际开始分钟非法 => 422：不是 SQLite 可原样存下的非负整数，或早于
+    6. 归档冻结的（配方 ID, 冻结版本）命中当前质检阻断 => 409（附当前
+       版本、被阻断配方与来源炉次）；
+    7. 实际开始分钟非法 => 422：不是 SQLite 可原样存下的非负整数，或早于
        计划开始，或早于上一炉次的实际结束分钟。
 
     校验通过：写入 running 执行记录，冻结当时的计划开始与计划结束
@@ -1367,7 +1390,8 @@ def start_furnace_run(
             if not (_SQLITE_INT_MIN <= draft_id <= _SQLITE_INT_MAX):
                 raise NotFound(f"炉次草稿 {draft_id} 不存在。")
             draft = conn.execute(
-                "SELECT id FROM drafts WHERE id=?", (draft_id,)
+                "SELECT id, recipe_ids, recipe_versions_json FROM drafts WHERE id=?",
+                (draft_id,),
             ).fetchone()
             if draft is None:
                 raise NotFound(f"炉次草稿 {draft_id} 不存在。")
@@ -1422,6 +1446,34 @@ def start_furnace_run(
             plan_start = int(first["start_minute"])
             steps = len(json.loads(first["result_json"])["temperatures"])
             plan_end = plan_start + steps * 5
+
+            # 质检阻断：按归档冻结的（配方 ID, 冻结版本）核对当前阻断，
+            # 命中即 409 并附配方与来源炉次。计划首项必为已归档炉次，其
+            # recipe_versions_json 即归档时冻结的版本。阻断与开炉在同一
+            # 写互斥锁下按请求先后串行生效：阻断先提交则不能开炉；先开炉
+            # 的进行中炉次不受此后提交的阻断影响，仍可正常结束。
+            ref_versions = json.loads(draft["recipe_versions_json"])
+            ref_pairs = {
+                (rid, ref_versions[str(rid)])
+                for rid in json.loads(draft["recipe_ids"])
+            }
+            hits = [
+                b
+                for b in _recipe_blocks(conn)
+                if (b["recipeId"], b["version"]) in ref_pairs
+            ]
+            if hits:
+                parts = "；".join(
+                    f"配方 {b['recipeId']} 版本 {b['version']}"
+                    f"（来源炉次 {', '.join(map(str, b['sourceDraftIds']))}）"
+                    for b in hits
+                )
+                raise Conflict(
+                    f"同版工艺已被质检阻断，不能开炉：{parts}。",
+                    current_version,
+                    extra={"blocks": hits},
+                )
+
             if not (0 <= actual_start <= _SQLITE_INT_MAX):
                 raise Unprocessable(
                     f"实际开始分钟 {actual_start} 超出可存储范围"
@@ -1552,3 +1604,188 @@ def finish_furnace_run(draft_id: int, actual_end: int) -> dict:
                 _RUN_SELECT + " WHERE id=?", (row["id"],)
             ).fetchone()
             return _run_dict(updated)
+
+
+# ---------------- 已结束炉次实测温度质检与同版工艺阻断 ----------------
+
+
+def _quality_dict(row) -> dict:
+    """组装一份质检记录的读取结构：实测温度、逐项结论与整体结论。"""
+    return {
+        "draftId": row["draft_id"],
+        "actualStartMinute": row["actual_start_minute"],
+        "actualEndMinute": row["actual_end_minute"],
+        "temperatures": json.loads(row["temperatures_json"]),
+        "items": json.loads(row["items_json"]),
+        "passed": bool(row["passed"]),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+_QUALITY_SELECT = """
+SELECT q.draft_id AS draft_id, q.temperatures_json AS temperatures_json,
+       q.items_json AS items_json, q.passed AS passed,
+       q.created_at AS created_at, q.updated_at AS updated_at,
+       r.actual_start_minute AS actual_start_minute,
+       r.actual_end_minute AS actual_end_minute
+FROM run_quality q
+JOIN furnace_runs r ON r.draft_id = q.draft_id
+"""
+
+
+def _finished_run_row(conn, draft_id: int):
+    """取已结束的开炉记录；未知炉次 404，未开炉 / 进行中 422。"""
+    draft = conn.execute(
+        "SELECT id FROM drafts WHERE id=?", (draft_id,)
+    ).fetchone()
+    if draft is None:
+        raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+    run = conn.execute(
+        """SELECT actual_start_minute, actual_end_minute, status
+           FROM furnace_runs WHERE draft_id=?""",
+        (draft_id,),
+    ).fetchone()
+    if run is None:
+        raise Unprocessable(
+            f"炉次 {draft_id} 尚未开炉，质检需要已结束的开炉记录。"
+        )
+    if run["status"] != "finished":
+        raise Unprocessable(
+            f"炉次 {draft_id} 尚未结束，质检需要已结束的开炉记录。"
+        )
+    return run
+
+
+def submit_run_quality(draft_id: int, raw_temperatures) -> dict:
+    """提交或整份替换一个已结束炉次的实测温度与质检结论（不合格也保存）。
+
+    单条事务内按以下顺序校验（任何失败都不写入、原有质检记录不变）：
+
+    1. 炉次 ID 未知（含超出 SQLite 有符号 64 位范围）=> 404；
+    2. 未开炉 / 进行中（未结束）=> 422；
+    3. 实测温度不是 1～20 个 0～200°C 有限数 => 422；
+    4. 档数 ×5 不等于实际时长（实际结束 − 实际开始分钟）=> 422。
+
+    校验通过：按归档冻结配方（材料参数与冻结版本）逐项核验连续保温与
+    全程耐受（不核验升降温及末温），实测与逐项结论整份写入（每炉次
+    一份，重复提交整份替换）。替换后本炉次对阻断的贡献按新结论增减，
+    同版其他失败来源不受影响。
+    """
+    now = _now()
+    with write_lock(), lock(), connect() as conn:
+        with _tx(conn):
+            if not (_SQLITE_INT_MIN <= draft_id <= _SQLITE_INT_MAX):
+                raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+            run = _finished_run_row(conn, draft_id)
+
+            try:
+                temperatures = quality.validate_temperatures(raw_temperatures)
+            except ValueError as exc:
+                raise Unprocessable(str(exc)) from exc
+
+            start = int(run["actual_start_minute"])
+            end = int(run["actual_end_minute"])
+            duration = end - start
+            if len(temperatures) * quality.SLOT_MINUTES != duration:
+                raise Unprocessable(
+                    f"实测温度档数 ×5（{len(temperatures) * quality.SLOT_MINUTES}"
+                    f" 分钟）须等于实际时长 {duration} 分钟（实际开始 {start}、"
+                    f"实际结束 {end}）。"
+                )
+
+            # 归档冻结快照：引用顺序、冻结配方版本与冻结材料参数。已结束的
+            # 炉次必为已归档（开炉要求其计划在列，计划只安排已归档炉次）
+            archived = conn.execute(
+                """SELECT d.recipe_ids AS recipe_ids,
+                          d.recipe_versions_json AS recipe_versions_json,
+                          a.materials_json AS materials_json
+                   FROM drafts d
+                   JOIN archives a ON a.draft_id = d.id
+                   WHERE d.id=?""",
+                (draft_id,),
+            ).fetchone()
+            if archived is None:
+                raise Unprocessable(
+                    f"炉次 {draft_id} 尚未归档，质检需要归档冻结的配方快照。"
+                )
+            items = quality.compute_items(
+                temperatures,
+                json.loads(archived["recipe_ids"]),
+                json.loads(archived["recipe_versions_json"]),
+                json.loads(archived["materials_json"]),
+            )
+            passed = not any(quality.item_failed(it) for it in items)
+
+            conn.execute(
+                """INSERT INTO run_quality
+                       (draft_id, temperatures_json, items_json, passed,
+                        created_at, updated_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(draft_id) DO UPDATE SET
+                       temperatures_json=excluded.temperatures_json,
+                       items_json=excluded.items_json,
+                       passed=excluded.passed,
+                       updated_at=excluded.updated_at""",
+                (
+                    draft_id,
+                    _dumps(temperatures),
+                    _dumps(items),
+                    1 if passed else 0,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                _QUALITY_SELECT + " WHERE q.draft_id=?", (draft_id,)
+            ).fetchone()
+            return _quality_dict(row)
+
+
+def get_run_quality(draft_id: int) -> dict:
+    """读取一个炉次的质检记录：未知炉次 404；尚无质检记录 404。"""
+    with lock(), connect() as conn:
+        if not (_SQLITE_INT_MIN <= draft_id <= _SQLITE_INT_MAX):
+            raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+        draft = conn.execute(
+            "SELECT id FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()
+        if draft is None:
+            raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+        row = conn.execute(
+            _QUALITY_SELECT + " WHERE q.draft_id=?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"炉次 {draft_id} 尚无质检记录。")
+        return _quality_dict(row)
+
+
+def _recipe_blocks(conn) -> list[dict]:
+    """在已持锁的连接上由质检表推导当前全部阻断。
+
+    任一未达标或超限项对应的（配方 ID, 冻结版本）被阻断，来源为对应
+    炉次；同一版本的多个失败来源合并列出。按配方 ID、版本升序返回。
+    """
+    rows = conn.execute(
+        "SELECT draft_id, items_json FROM run_quality WHERE passed=0"
+    ).fetchall()
+    sources: dict[tuple[int, int], set[int]] = {}
+    for r in rows:
+        for item in json.loads(r["items_json"]):
+            if quality.item_failed(item):
+                key = (item["recipeId"], item["version"])
+                sources.setdefault(key, set()).add(r["draft_id"])
+    return [
+        {
+            "recipeId": recipe_id,
+            "version": version,
+            "sourceDraftIds": sorted(draft_ids),
+        }
+        for (recipe_id, version), draft_ids in sorted(sources.items())
+    ]
+
+
+def list_recipe_blocks() -> dict:
+    """读取当前全部同版工艺阻断（配方 ID、冻结版本与来源炉次）。只读。"""
+    with lock(), connect() as conn:
+        return {"blocks": _recipe_blocks(conn)}
